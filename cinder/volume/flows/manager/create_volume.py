@@ -1066,6 +1066,8 @@ class CreateVolumeFromSpecTask(flow_utils.CinderTask):
                 finally:
                     volume.size = original_size
                     volume.save()
+                    if model_update:
+                        model_update['size'] = original_size
 
         return model_update
 

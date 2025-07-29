@@ -22,6 +22,7 @@ from castellan.common import exception as castellan_exc
 from castellan.tests.unit.key_manager import mock_key_manager
 import ddt
 from oslo_utils import imageutils
+from oslo_utils import units
 
 from cinder import context
 from cinder import exception
@@ -2510,3 +2511,97 @@ class CreateVolumeFlowManagerImageCacheTestCase(test.TestCase):
                 image_meta,
                 self.mock_image_service,
                 update_cache=True)
+
+    @mock.patch('cinder.image.image_utils.check_available_space')
+    @mock.patch('cinder.image.image_utils.qemu_img_info')
+    @mock.patch('cinder.message.api.API.create')
+    @mock.patch('cinder.image.image_utils.verify_glance_image_signature')
+    def test_create_from_image_cache_powerflex_size_mismatch(
+            self, mock_verify, mock_message_create, mock_qemu_info,
+            mock_check_space, mock_get_internal_context,
+            mock_create_from_img_dl, mock_create_from_src,
+            mock_handle_bootable, mock_fetch_img):
+        """Test PowerFlex volume creation from image with correct final size.
+
+        Scenario:
+        1. Image virtual size: 10GiB
+        2. Requested volume size: 24GiB
+        3. Initial PowerFlex size: 16GiB (rounded to 8GiB multiple)
+        4. Final size should be: 24GiB
+        """
+        # Setup internal context mock
+        # mock_get_internal_context.return_value = self.ctxt
+
+        # Setup image info with 10GiB virtual size
+        image_info = imageutils.QemuImgInfo()
+        image_info.virtual_size = 10 * units.Gi
+        mock_qemu_info.return_value = image_info
+
+        # Disable image signature verification
+        self.flags(verify_glance_signatures='disabled')
+
+        # Setup volume with 24GiB size
+        volume = fake_volume.fake_volume_obj(
+            self.ctxt,
+            id=fakes.VOLUME_ID,
+            size=24,
+            host='host@powerflex#pool'
+        )
+
+        # Mock the volume.save method
+        volume.save = mock.MagicMock(return_value=None)
+
+        # Setup image details
+        image_id = fakes.IMAGE_ID
+        image_location = 'someImageLocationStr'
+        image_meta = {
+            'id': image_id,
+            'size': 10 * units.Gi,
+            'virtual_size': 10 * units.Gi,
+            'disk_format': 'raw'
+        }
+
+        # Configure mocks for PowerFlex behavior
+        self.mock_driver.clone_image.return_value = (None, False)
+        self.mock_cache.get_entry.return_value = None
+
+        # Mock the create_from_image_download to return volume
+        # with 16GiB size
+        def mock_create_download(
+                context,
+                volume,
+                image_location,
+                image_meta,
+                image_service):
+            # Update volume size to 16 as PowerFlex rounds
+            volume.size = 16
+            return {'status': 'available', 'size': 16}
+
+        mock_create_from_img_dl.side_effect = mock_create_download
+
+        # Mock extend_volume to update size to 24
+        def mock_extend(volume, new_size):
+            volume.size = new_size
+            return {'size': new_size}
+
+        self.mock_driver.extend_volume.side_effect = mock_extend
+
+        manager = create_volume_manager.CreateVolumeFromSpecTask(
+            self.mock_volume_manager,
+            self.mock_db,
+            self.mock_driver,
+            image_volume_cache=self.mock_cache
+        )
+
+        # Execute the method under test
+        result = manager._create_from_image_cache_or_download(
+            self.ctxt,
+            volume,
+            image_location,
+            image_id,
+            image_meta,
+            self.mock_image_service
+        )
+
+        # Verify the final size is correct (24GiB)
+        self.assertEqual(24, result['size'])
